@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 import pdb
 import json
+import glob
 
 # ---------------------------------------------------------------------------
 # Small helpers. These are given to students; the exercise is the probes.
@@ -143,8 +144,15 @@ def probe_memory_total_kb(root: Path = Path("/")) -> dict[str, Any]:
     ever sees the pool. Students are expected to notice and to explain it in
     their report rather than round it up.
     """
-    
-    return {"value": int(m.group(1)), "source": src, "status": "ok"}
+    src = '/proc/meminfo'
+    raw = read_text(root, src)
+
+    m = re.match(r'^MemTotal:\s+(\d+)\s*kB.', raw)
+
+    if m:
+        return {"value": int(m.group(1)), "source": src, "status": "ok"}
+    else:
+        unknown("", "")
 
 
 def probe_root_source(root: Path = Path("/")) -> dict[str, Any]:
@@ -159,8 +167,37 @@ def probe_root_source(root: Path = Path("/")) -> dict[str, Any]:
     /proc/mounts is preferred over `findmnt` because it needs no external
     binary and no elevation, and because it is what findmnt reads anyway.
     """
-    
-    return unknown(src, "no root mount entry found in mount table")
+
+    src = '/proc/mounts'
+    raw = read_text(root, src)
+
+    if not raw:
+        return unknown()
+
+    lines = raw.split("\n")
+    name = ""
+    kind = ""
+
+    # splitting into each line
+    for line in lines[0]:
+        # splitting into words
+        attributes = line.split()
+
+        if attributes:
+            name = attributes[0]
+            kind = None
+            if attributes[0].startswith("/dev/nvme"):
+                kind = "nvme"
+            elif attributes[0].startswith("/dev/mmchlk"):
+                kind = "ssd"
+                pass
+            elif attributes[0].startswith("/dev/sd"):
+                kind = "ssd"
+
+    return {"value": name, 
+            "kind": kind,
+            "source": src,
+            "status": "ok"}
 
 
 def probe_nvme_present(root: Path = Path("/")) -> dict[str, Any]:
@@ -171,11 +208,24 @@ def probe_nvme_present(root: Path = Path("/")) -> dict[str, Any]:
     is what lets the troubleshooting tree in the lab guide send a student to
     the right branch.
     """
+    src = "/sys/block/nvme0n1"
+    raw = read_text(root, src)
+
+    is_present = raw == None
+
+    src2 = "/sys/block/nvme0n1/device/model"
+    raw2 = read_text(root, src2)
+    m = re.search(r"\s+", raw2)
+    model = ""
+    
+    # stripping all null spaces
+    if m:
+        model = m.group().rstrip("\x00").strip()
     
     return {
-        "value": ,
-        "model": ,
-        "source": ,
+        "value": is_present,
+        "model": model,
+        "source": src,
         "status": "ok",
     }
 
@@ -191,15 +241,27 @@ def probe_pcie_link(root: Path = Path("/"), lspci_output: str | None = None) -> 
     `lspci_output` exists so the tests can drive this without root or hardware.
     In normal use it is None and the probe shells out.
     """
-        
-    return {
-        "value":,
-        "negotiated": ,
-        "capability": ,
-        "interpretation": ,
-        "source": ,
-        "status": "ok",
-    }
+    output = run(["lspci", "-vv"])
+    lnk_stat = ""
+    for line in output.splitlines():
+        if "LnkCap" in line:
+            lnk_cap = _parse_link_line(line.strip())
+        if "LnkSta" in line:
+            lnk_stat = _parse_link_line(line.strip())
+
+    src = "/proc/device-tree/model"
+
+    if lnk_stat and lnk_cap: 
+        return {
+            "value": lnk_stat,
+            "negotiated": lnk_cap["width"],
+            "capability": lnk_stat["width"],
+            "interpretation": generate_interpretation_string(lnk_cap["width"], lnk_stat["width"]),
+            "source": src,
+            "status": "ok",
+        }
+    else:
+        unknown("", "")
 
 
 def probe_thermal_zones(root: Path = Path("/")) -> dict[str, Any]:
@@ -210,10 +272,20 @@ def probe_thermal_zones(root: Path = Path("/")) -> dict[str, Any]:
     than once, and it is a good, cheap lesson in reading units before reading
     numbers.
     """
+    src = "/sys/class/thermal/thermal_zone*/"
+    subdirs = glob.glob(src)
+
+    temps = []
+    types = []
+
+    for subdir in subdirs:
+        temps.append(read_text(root=Path(subdir), rel="/type"))
+        types.append(read_text(root=Path(subdir), rel="/temp"))
+
     return {
-        "value": ,
-        "zones": ,
-        "source": ,
+        "value": max(temps),
+        "zones": types,
+        "source": src + "temp",
         "status": "ok",
     }
 
@@ -226,10 +298,17 @@ def probe_power_mode(root: Path = Path("/"), nvpmodel_output: str | None = None)
     same model are usually reporting different power modes, and without this
     field there is no way to find that out after the fact.
     """
+    output = run(["nvpmodel", "-q"])
+    if not output:
+        uknown()
+
+    m = re.search(r'NV Power Mode:\s*(.+) .', output)
+    m2 = re.search(r"^\s*(\d+)\s*$", m.group(1))
+
     return {
-        "value": ,
-        "mode_id": ,
-        "source": ,
+        "value": m2.group(1),
+        "mode_id": m2.group(1),
+        "source": "nvpmodel -q",
         "status": "ok",
     }
 
@@ -239,18 +318,18 @@ def probe_power_mode(root: Path = Path("/"), nvpmodel_output: str | None = None)
 #     print(out)
 
 # for generating system_report.json
-if __name__ == "__main__":
-    report = {
-        "module_model": probe_module_model(),
-        "memory_total_kb": probe_memory_total_kb(),
-        "root_source": probe_root_source(),
-        "nvme_present": probe_nvme_present(),
-        "pcie_link": probe_pcie_link(),
-        "thermal_zones": probe_thermal_zones(),
-        "power_mode": probe_power_mode(),
-    }
+# if __name__ == "__main__":
+#     report = {
+#         "module_model": probe_module_model(),
+#         "memory_total_kb": probe_memory_total_kb(),
+#         "root_source": probe_root_source(),
+#         "nvme_present": probe_nvme_present(),
+#         "pcie_link": probe_pcie_link(),
+#         "thermal_zones": probe_thermal_zones(),
+#         "power_mode": probe_power_mode(),
+#     }
     
-    path = "system_report.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=4)
+#     path = "system_report.json"
+#     with open(path, "w", encoding="utf-8") as f:
+#         json.dump(report, f, indent=4)
 
