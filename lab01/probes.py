@@ -94,8 +94,8 @@ def _parse_link_line(line: str) -> dict[str, Any]:
         "gen": _GEN_BY_GTS.get(gts) if gts is not None else None,
     }
 
-def generate_interpretation_string(neg_speed, cap_speed):
-    if cap_speed > neg_speed:
+def generate_interpretation_string(negotiated, capability):
+    if capability['gen'] > negotiated['gen']:
         interpretation = (
             f"drive capable of Gen{capability['gen']}, link running at "
             f"Gen{negotiated['gen']} — expected on this carrier board, "
@@ -149,7 +149,7 @@ def probe_memory_total_kb(root: Path = Path("/")) -> dict[str, Any]:
     if not raw:
         return unknown(src, "meminfo absent or unreadable")
 
-    m = re.match(r'^MemTotal:\s+(\d+)\s*kB.', raw)
+    m = re.match(r'MemTotal:\s+(\d+)\s*kB', raw)
 
     if m:
         return {"value": int(m.group(1)), "source": src, "status": "ok"}
@@ -256,10 +256,18 @@ def probe_pcie_link(root: Path = Path("/"), lspci_output: str | None = None) -> 
     lnk_stat = None
     lnk_cap = None
     for line in output.splitlines():
-        if "LnkCap" in line:
-            lnk_cap = _parse_link_line(line.strip())
-        if "LnkSta" in line:
-            lnk_stat = _parse_link_line(line.strip())
+        if "LnkCap:" in line:
+            tmp = _parse_link_line(line.strip())
+            if tmp:
+                lnk_cap = tmp
+        if "LnkSta:" in line:
+            tmp = _parse_link_line(line.strip())
+            if tmp:
+                lnk_stat = tmp
+        
+        # after getting first occurrence, stop looping
+        if lnk_stat and lnk_cap:
+            break
 
     if lnk_stat and lnk_cap:
         return {
@@ -289,19 +297,26 @@ def probe_thermal_zones(root: Path = Path("/")) -> dict[str, Any]:
     zones = []
     for subdir in subdirs:
         subdir_path = Path(subdir)
-        type_raw = read_text(root=subdir_path, rel="type")
-        temp_raw = read_text(root=subdir_path, rel="temp")
+
+        try:
+            type_raw = read_text(root=subdir_path, rel="type")
+            temp_raw = read_text(root=subdir_path, rel="temp")
+        except (TypeError, ValueError, OSError):
+            continue
+
         if type_raw is None or temp_raw is None:
             continue
+
         try:
             temp_c = int(temp_raw) / 1000
         except ValueError:
             continue
-        zones.append({"zone": subdir_path.name, "type": type_raw, "temp_c": temp_c})
 
+        zones.append({"zone": subdir_path.name, "type": type_raw, "temp_c": temp_c})
+ 
     if not zones:
         return unknown(src + "temp", "no readable thermal zones found")
-
+ 
     return {
         "value": max(z["temp_c"] for z in zones),
         "zones": zones,
