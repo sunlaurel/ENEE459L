@@ -107,7 +107,6 @@ def generate_interpretation_string(neg_speed, cap_speed):
             f"x{negotiated['width']}"
         )
     return interpretation
-    
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +146,15 @@ def probe_memory_total_kb(root: Path = Path("/")) -> dict[str, Any]:
     src = '/proc/meminfo'
     raw = read_text(root, src)
 
+    if not raw:
+        return unknown(src, "meminfo absent or unreadable")
+
     m = re.match(r'^MemTotal:\s+(\d+)\s*kB.', raw)
 
     if m:
         return {"value": int(m.group(1)), "source": src, "status": "ok"}
     else:
-        unknown("", "")
+        return unknown(src, "MemTotal line not found or not in expected format")
 
 
 def probe_root_source(root: Path = Path("/")) -> dict[str, Any]:
@@ -172,32 +174,37 @@ def probe_root_source(root: Path = Path("/")) -> dict[str, Any]:
     raw = read_text(root, src)
 
     if not raw:
-        return unknown()
+        return unknown(src, "/proc/mounts absent or unreadable")
 
     lines = raw.split("\n")
-    name = ""
-    kind = ""
+    name = None
+    kind = None
 
     # splitting into each line
-    for line in lines[0]:
+    for line in lines:
         # splitting into words
         attributes = line.split()
 
-        if attributes:
-            name = attributes[0]
-            kind = None
-            if attributes[0].startswith("/dev/nvme"):
-                kind = "nvme"
-            elif attributes[0].startswith("/dev/mmchlk"):
-                kind = "ssd"
-                pass
-            elif attributes[0].startswith("/dev/sd"):
-                kind = "ssd"
+        if not attributes:
+            continue
 
-    return {"value": name, 
-            "kind": kind,
-            "source": src,
-            "status": "ok"}
+        dev = attributes[0]
+        if dev.startswith("/dev/nvme"):
+            name, kind = dev, "nvme"
+            break
+        elif dev.startswith("/dev/mmcblk"):
+            name, kind = dev, "ssd"
+            break
+        elif dev.startswith("/dev/sd"):
+            name, kind = dev, "ssd"
+            break
+
+    if name is None:
+        return unknown(
+            src, "no /dev/nvme*, /dev/mmcblk*, or /dev/sd* entry found in mounts"
+        )
+
+    return {"value": name, "kind": kind, "source": src, "status": "ok"}
 
 
 def probe_nvme_present(root: Path = Path("/")) -> dict[str, Any]:
@@ -211,17 +218,16 @@ def probe_nvme_present(root: Path = Path("/")) -> dict[str, Any]:
     src = "/sys/block/nvme0n1"
     raw = read_text(root, src)
 
-    is_present = raw == None
+    is_present = (Path(root) / src.lstrip("/")).exists()
 
     src2 = "/sys/block/nvme0n1/device/model"
-    raw2 = read_text(root, src2)
-    m = re.search(r"\s+", raw2)
     model = ""
-    
-    # stripping all null spaces
-    if m:
-        model = m.group().rstrip("\x00").strip()
-    
+
+    if is_present:
+        raw2 = read_text(root, src2)
+        if raw2:
+            model = raw2.rstrip("\x00").strip()
+
     return {
         "value": is_present,
         "model": model,
@@ -241,27 +247,31 @@ def probe_pcie_link(root: Path = Path("/"), lspci_output: str | None = None) -> 
     `lspci_output` exists so the tests can drive this without root or hardware.
     In normal use it is None and the probe shells out.
     """
-    output = run(["lspci", "-vv"])
-    lnk_stat = ""
+    src = "lspci -vv"
+    output = lspci_output if lspci_output is not None else run(["lspci", "-vv"])
+
+    if not output:
+        return unknown(src, "lspci unavailable, not permitted, or produced no output")
+
+    lnk_stat = None
+    lnk_cap = None
     for line in output.splitlines():
         if "LnkCap" in line:
             lnk_cap = _parse_link_line(line.strip())
         if "LnkSta" in line:
             lnk_stat = _parse_link_line(line.strip())
 
-    src = "/proc/device-tree/model"
-
-    if lnk_stat and lnk_cap: 
+    if lnk_stat and lnk_cap:
         return {
-            "value": lnk_stat,
-            "negotiated": lnk_cap["width"],
-            "capability": lnk_stat["width"],
-            "interpretation": generate_interpretation_string(lnk_cap["width"], lnk_stat["width"]),
+            "value": lnk_stat["raw"],
+            "negotiated": lnk_stat,
+            "capability": lnk_cap,
+            "interpretation": generate_interpretation_string(lnk_stat, lnk_cap),
             "source": src,
             "status": "ok",
         }
     else:
-        unknown("", "")
+        return unknown(src, "LnkCap/LnkSta lines not found in lspci output")
 
 
 def probe_thermal_zones(root: Path = Path("/")) -> dict[str, Any]:
@@ -273,18 +283,28 @@ def probe_thermal_zones(root: Path = Path("/")) -> dict[str, Any]:
     numbers.
     """
     src = "/sys/class/thermal/thermal_zone*/"
-    subdirs = glob.glob(src)
+    pattern = str(Path(root) / src.lstrip("/"))
+    subdirs = sorted(glob.glob(pattern))
 
-    temps = []
-    types = []
-
+    zones = []
     for subdir in subdirs:
-        temps.append(read_text(root=Path(subdir), rel="/type"))
-        types.append(read_text(root=Path(subdir), rel="/temp"))
+        subdir_path = Path(subdir)
+        type_raw = read_text(root=subdir_path, rel="type")
+        temp_raw = read_text(root=subdir_path, rel="temp")
+        if type_raw is None or temp_raw is None:
+            continue
+        try:
+            temp_c = int(temp_raw) / 1000
+        except ValueError:
+            continue
+        zones.append({"zone": subdir_path.name, "type": type_raw, "temp_c": temp_c})
+
+    if not zones:
+        return unknown(src + "temp", "no readable thermal zones found")
 
     return {
-        "value": max(temps),
-        "zones": types,
+        "value": max(z["temp_c"] for z in zones),
+        "zones": zones,
         "source": src + "temp",
         "status": "ok",
     }
@@ -298,17 +318,23 @@ def probe_power_mode(root: Path = Path("/"), nvpmodel_output: str | None = None)
     same model are usually reporting different power modes, and without this
     field there is no way to find that out after the fact.
     """
-    output = run(["nvpmodel", "-q"])
+    src = "nvpmodel -q"
+    output = nvpmodel_output if nvpmodel_output is not None else run(["nvpmodel", "-q"])
     if not output:
-        uknown()
+        return unknown(
+            src, "nvpmodel unavailable, not permitted, or produced no output"
+        )
 
-    m = re.search(r'NV Power Mode:\s*(.+) .', output)
-    m2 = re.search(r"^\s*(\d+)\s*$", m.group(1))
+    m = re.search(r"NV Power Mode:\s*(.+)", output)
+    m2 = re.search(r"^\s*(\d+)\s*$", output, re.MULTILINE)
+
+    if not m or not m2:
+        return unknown(src, "could not parse mode name or mode id from nvpmodel output")
 
     return {
-        "value": m2.group(1),
-        "mode_id": m2.group(1),
-        "source": "nvpmodel -q",
+        "value": m.group(1).strip(),
+        "mode_id": int(m2.group(1)),
+        "source": src,
         "status": "ok",
     }
 
@@ -318,18 +344,17 @@ def probe_power_mode(root: Path = Path("/"), nvpmodel_output: str | None = None)
 #     print(out)
 
 # for generating system_report.json
-# if __name__ == "__main__":
-#     report = {
-#         "module_model": probe_module_model(),
-#         "memory_total_kb": probe_memory_total_kb(),
-#         "root_source": probe_root_source(),
-#         "nvme_present": probe_nvme_present(),
-#         "pcie_link": probe_pcie_link(),
-#         "thermal_zones": probe_thermal_zones(),
-#         "power_mode": probe_power_mode(),
-#     }
-    
-#     path = "system_report.json"
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(report, f, indent=4)
+if __name__ == "__main__":
+    report = {
+        "module_model": probe_module_model(),
+        "memory_total_kb": probe_memory_total_kb(),
+        "root_source": probe_root_source(),
+        "nvme_present": probe_nvme_present(),
+        "pcie_link": probe_pcie_link(),
+        "thermal_zones": probe_thermal_zones(),
+        "power_mode": probe_power_mode(),
+    }
 
+    path = "system_report.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=4)
